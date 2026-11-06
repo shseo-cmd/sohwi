@@ -153,6 +153,8 @@
   /* ---------- waveform ---------- */
   .wavewrap { position: relative; }
   canvas { display: block; width: 100%; }
+  /* the waveforms are scrubbable, so say so with the cursor */
+  #wave, #result { cursor: pointer; touch-action: none; }
   #wave { height: 172px; }
   #result { height: 46px; }
   .strip-label {
@@ -268,8 +270,9 @@
           <button id="playSrc">원본 재생</button>
           <button id="playRes">결과 재생</button>
           <button id="stop" disabled>정지</button>
-          <span class="clock mono" id="clock">00:00:00:00</span>
+          <span class="clock mono" id="clock">00:00:00:00 / 00:00:00:00</span>
         </div>
+        <div class="strip-label"><span>파형을 클릭하거나 드래그해 원하는 지점부터 재생</span></div>
       </section>
 
       <section class="panel">
@@ -371,11 +374,14 @@
           <label class="ctl">
             <span class="ctl-top"><span class="ctl-name">인식 모델</span></span>
             <select id="model">
-              <option value="Xenova/whisper-tiny" selected>tiny — 빠름 · 약 40MB (권장)</option>
-              <option value="Xenova/whisper-base">base — 정확 · 약 100MB · 느린 PC엔 부담</option>
+              <option value="Xenova/whisper-small" selected>small — 정확 · 약 250MB (권장)</option>
+              <option value="Xenova/whisper-base">base — 중간 · 약 80MB</option>
+              <option value="Xenova/whisper-tiny">tiny — 가장 빠름 · 약 40MB · 오탈자 많음</option>
+              <option value="onnx-community/whisper-large-v3-turbo">large-v3-turbo — 가장 정확 · 약 1.5GB · WebGPU 필요 (실험적)</option>
             </select>
-            <span class="ctl-hint">처음 한 번만 내려받아 브라우저에 저장됩니다. 사양이 낮은 컴퓨터라면 tiny로 두세요.</span>
+            <span class="ctl-hint" id="modelHint">처음 한 번만 내려받아 브라우저에 저장됩니다. 한국어는 클수록 확실히 정확합니다.</span>
           </label>
+          <p class="ctl-hint" id="gpuNote" hidden style="margin:6px 0 0;color:var(--accent);"></p>
           <button id="cancel" hidden style="margin-top:10px;">자막 생성 중단</button>
           <span class="ctl-hint" style="display:block;margin-top:8px;">인식은 <strong>항상 백그라운드 스레드에서만</strong> 실행됩니다. 진행 중에도 화면이 멈추지 않고 언제든 중단할 수 있으며, 백그라운드 실행이 불가능한 환경에서는 자막만 건너뛰고 오디오·XML은 정상적으로 만들어집니다.</span>
         </div>
@@ -434,6 +440,7 @@
     env: null, hop: 0.01, peaks: null,
     sil: [], cuts: [], keeps: [],
     src: null, playing: null, raf: 0, startedAt: 0, playDur: 0,
+    offset: 0, head: { src: 0, res: 0 }, scrub: null,
     trimmed: null, trimmedKey: ""
   };
   var P = { pad: 0.1, thresh: -35, minsil: 0.12, fps: 30, w: 1080, h: 1350 };
@@ -516,9 +523,20 @@
     }
     if (start >= 0 && (env.length - start) * hop >= P.minsil) sil.push([start * hop, dur]);
 
-    var cuts = [], pad = P.pad;
+    // Every edit point is decided ON THE FRAME GRID, because that is the only
+    // grid Premiere can place an edit on. If the cuts were chosen at exact sample
+    // positions instead, Premiere would round each one to the nearest frame on
+    // import — up to half a frame away (16.5 ms at 30fps, 735 samples at 44.1kHz)
+    // from what was auditioned here — which clips the first syllable of a phrase
+    // and leaves stray gaps elsewhere. Snapping here instead means the waveform
+    // preview, the exported WAV and the Premiere timeline describe one identical
+    // edit. The snap goes INWARD (remove slightly less silence), so a rounding
+    // error can only ever leave a few extra milliseconds of room — never eat speech.
+    var fps = P.fps, cuts = [], pad = P.pad;
+    var lastFrame = Math.floor(dur * fps), endT = lastFrame / fps;
     for (i = 0; i < sil.length; i++) {
-      var a = sil[i][0] + pad, b = sil[i][1] - pad;
+      var a = Math.ceil((sil[i][0] + pad) * fps) / fps;
+      var b = Math.floor((sil[i][1] - pad) * fps) / fps;
       if (b - a > 0.02) cuts.push([a, b]);
     }
     var keeps = [], pos = 0;
@@ -526,7 +544,8 @@
       if (cuts[i][0] > pos) keeps.push([pos, cuts[i][0]]);
       pos = cuts[i][1];
     }
-    if (pos < dur) keeps.push([pos, dur]);
+    // the tail ends on a whole frame that still exists in the media
+    if (endT - pos > 0.001) keeps.push([pos, endT]);
 
     S.sil = sil; S.cuts = cuts; S.keeps = keeps;
     S.trimmed = null;
@@ -663,16 +682,23 @@
       pos += len;
     }
     $("rows").innerHTML = html;
-    drawWave(null); drawResult(null);
+    // redraw the waveforms AND refresh the position/duration readout: the
+    // result length changes whenever the detection settings do
+    paintHeads();
   }
 
   function recompute() {
-    segment(); paint();
+    segment();
+    // the result timeline just changed length — keep the playhead inside it
+    clampHeads();
+    paint();
   }
 
   /* ============ trimmed buffer ============ */
   function buildTrimmed() {
-    var key = S.keeps.length + ":" + P.pad + ":" + P.thresh + ":" + P.minsil;
+    // fps is part of the key: the cut points are snapped to the frame grid, so a
+    // different frame rate is a different edit and the cached buffer is stale
+    var key = S.keeps.length + ":" + P.pad + ":" + P.thresh + ":" + P.minsil + ":" + P.fps;
     if (S.trimmed && S.trimmedKey === key) return S.trimmed;
     var buf = S.buffer, sr = buf.sampleRate, ch = buf.numberOfChannels;
     var total = 0, i, c;
@@ -698,38 +724,113 @@
   }
 
   /* ============ playback ============ */
-  function stop() {
-    if (S.src) { try { S.src.stop(); } catch (e) {} S.src.disconnect(); S.src = null; }
+  function viewDur(which) {
+    return which === "src" ? (S.buffer ? S.buffer.duration : 0) : resultDur();
+  }
+
+  // the playhead each view will start from; kept inside the view's length, which
+  // shrinks as the detection settings change
+  function clampHeads() {
+    S.head.src = Math.max(0, Math.min(S.head.src, viewDur("src")));
+    S.head.res = Math.max(0, Math.min(S.head.res, viewDur("res")));
+  }
+
+  // playback may have started from a seek offset, so count from there
+  function livePos() {
+    if (!S.playing) return 0;
+    var t = S.offset + (ctx.currentTime - S.startedAt);
+    return Math.max(0, Math.min(t, S.playDur));
+  }
+
+  function headOf(which) {
+    return S.playing === which ? livePos() : S.head[which];
+  }
+
+  function paintHeads() {
+    drawWave(headOf("src"));
+    drawResult(headOf("res"));
+    var which = S.playing || "res";
+    $("clock").textContent = tc(headOf(which), P.fps) + " / " + tc(viewDur(which), P.fps);
+  }
+
+  function stop(resetHead) {
+    if (S.src) {
+      S.src.onended = null;
+      try { S.src.stop(); } catch (e) {}
+      S.src.disconnect(); S.src = null;
+    }
     if (S.raf) cancelAnimationFrame(S.raf);
-    S.raf = 0; S.playing = null;
+    S.raf = 0;
+    // leave the playhead where it stopped so the next press resumes from there
+    if (S.playing) S.head[S.playing] = resetHead ? 0 : livePos();
+    S.playing = null;
     $("stop").disabled = true;
     $("playSrc").textContent = "원본 재생";
     $("playRes").textContent = "결과 재생";
-    drawWave(null); drawResult(null);
-    $("clock").textContent = tc(0, P.fps);
+    paintHeads();
   }
 
-  function play(which) {
+  function play(which, from) {
     stop();
-    if (ctx.state === "suspended") ctx.resume();
+    if (ctx.state === "suspended") { try { ctx.resume(); } catch (e) {} }
     var buf = which === "src" ? S.buffer : buildTrimmed();
+    if (!buf || !buf.duration) return;
+    var at = from == null ? S.head[which] : from;
+    // starting within a hair of the end would play nothing — go back to the top
+    if (at >= buf.duration - 0.02) at = 0;
+    at = Math.max(0, at);
+
     var node = ctx.createBufferSource();
-    node.buffer = buf; node.connect(ctx.destination);
-    node.onended = function () { if (S.playing === which) stop(); };
-    node.start();
-    S.src = node; S.playing = which; S.startedAt = ctx.currentTime; S.playDur = buf.duration;
+    node.buffer = buf;
+    node.connect(ctx.destination);
+    node.onended = function () { if (S.playing === which) stop(true); };
+    node.start(0, at);
+
+    S.src = node; S.playing = which; S.offset = at;
+    S.startedAt = ctx.currentTime; S.playDur = buf.duration;
+    S.head[which] = at;
     $("stop").disabled = false;
     $(which === "src" ? "playSrc" : "playRes").textContent = "재생 중";
     tick();
   }
 
   function tick() {
-    var t = ctx.currentTime - S.startedAt;
-    if (t > S.playDur) t = S.playDur;
-    $("clock").textContent = tc(t, P.fps);
-    if (S.playing === "src") { drawWave(t); drawResult(null); }
-    else { drawResult(t); drawWave(null); }
+    paintHeads();
     S.raf = requestAnimationFrame(tick);
+  }
+
+  /* ---------- scrubbing: click or drag a waveform to play from there ---------- */
+  function seekFromEvent(which, cv, e) {
+    var r = cv.getBoundingClientRect();
+    if (!r.width) return 0;
+    var x = Math.max(0, Math.min(e.clientX - r.left, r.width));
+    return (x / r.width) * viewDur(which);
+  }
+
+  function bindScrub(id, which) {
+    var cv = $(id);
+    cv.addEventListener("pointerdown", function (e) {
+      if (!S.buffer) return;
+      e.preventDefault();
+      if (S.playing) stop();
+      S.scrub = { which: which };
+      S.head[which] = seekFromEvent(which, cv, e);
+      try { cv.setPointerCapture(e.pointerId); } catch (err) {}
+      paintHeads();
+    });
+    cv.addEventListener("pointermove", function (e) {
+      if (!S.scrub || S.scrub.which !== which) return;
+      S.head[which] = seekFromEvent(which, cv, e);
+      paintHeads();
+    });
+    function release(e) {
+      if (!S.scrub || S.scrub.which !== which) return;
+      S.scrub = null;
+      try { cv.releasePointerCapture(e.pointerId); } catch (err) {}
+      play(which, S.head[which]);
+    }
+    cv.addEventListener("pointerup", release);
+    cv.addEventListener("pointercancel", release);
   }
 
   /* ============ encoders ============ */
@@ -773,6 +874,76 @@
     return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(stem) ? stem + "." + ext : "source." + ext;
   }
 
+  // The sample rate the ORIGINAL file really has, read from its own header.
+  // decodeAudioData resamples to the machine's audio-device rate (44100 on one
+  // computer, 48000 or 96000 on another), so S.buffer.sampleRate describes the
+  // viewer's hardware, not the file. Writing that into the XML made the same
+  // upload produce a different (and wrong) <samplerate> on every computer.
+  function sniffSampleRate(u8) {
+    try {
+      if (!u8 || u8.length < 16) return 0;
+      var dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength), n = u8.length, i;
+      var tag = function (o, s) { for (var k = 0; k < s.length; k++) if (u8[o + k] !== s.charCodeAt(k)) return false; return true; };
+      // WAV: RIFF....WAVE then chunks; fmt chunk holds the rate
+      if (tag(0, "RIFF") && tag(8, "WAVE")) {
+        for (i = 12; i + 8 <= n;) {
+          var sz = dv.getUint32(i + 4, true);
+          if (tag(i, "fmt ") && i + 16 <= n) return dv.getUint32(i + 12, true);
+          i += 8 + sz + (sz & 1);
+        }
+        return 0;
+      }
+      // FLAC: STREAMINFO rate is 20 bits at byte 18
+      if (tag(0, "fLaC") && n > 22) return (u8[18] << 12) | (u8[19] << 4) | (u8[20] >> 4);
+      // Ogg: Vorbis carries its rate; Opus always plays at 48000
+      if (tag(0, "OggS")) {
+        for (i = 0; i < Math.min(n - 16, 4096); i++) {
+          if (u8[i] === 1 && tag(i + 1, "vorbis")) return dv.getUint32(i + 12, true);
+          if (tag(i, "OpusHead")) return 48000;
+        }
+        return 0;
+      }
+      // MP4 / M4A: the audio track's mdhd timescale equals its sample rate
+      if (tag(4, "ftyp")) {
+        var walk = function (start, end, depth) {
+          var o = start, found = 0;
+          while (o + 8 <= end && !found) {
+            var size = dv.getUint32(o, false), type = String.fromCharCode(u8[o + 4], u8[o + 5], u8[o + 6], u8[o + 7]);
+            var hdr = 8;
+            if (size === 1) { size = dv.getUint32(o + 12, false); hdr = 16; }   // 64-bit size (high word ignored)
+            else if (size === 0) size = end - o;
+            if (size < hdr || o + size > end) break;
+            if (type === "moov" || type === "trak" || type === "mdia") {
+              found = walk(o + hdr, o + size, depth + 1);
+            } else if (type === "mdhd") {
+              var ver = u8[o + hdr];
+              audioCandidate = dv.getUint32(o + hdr + (ver === 1 ? 20 : 12), false);
+            } else if (type === "hdlr") {
+              if (tag(o + hdr + 8, "soun") && audioCandidate) { found = audioCandidate; }
+              else audioCandidate = 0;
+            }
+            o += size;
+          }
+          return found;
+        };
+        var audioCandidate = 0;
+        return walk(0, n, 0) || 0;
+      }
+      // MP3: skip an ID3v2 tag, then read the first frame header
+      var p = 0;
+      if (tag(0, "ID3") && n > 10) p = 10 + (((u8[6] & 0x7F) << 21) | ((u8[7] & 0x7F) << 14) | ((u8[8] & 0x7F) << 7) | (u8[9] & 0x7F));
+      for (i = p; i + 4 <= Math.min(n, p + 65536); i++) {
+        if (u8[i] === 0xFF && (u8[i + 1] & 0xE0) === 0xE0) {
+          var ver2 = (u8[i + 1] >> 3) & 3, layer = (u8[i + 1] >> 1) & 3, idx = (u8[i + 2] >> 2) & 3;
+          if (ver2 === 1 || layer === 0 || idx === 3) continue;
+          var base = [44100, 48000, 32000][idx];
+          return ver2 === 3 ? base : ver2 === 2 ? base / 2 : base / 4;
+        }
+      }
+    } catch (e) {}
+    return 0;
+  }
+
   // XML points at the ORIGINAL upload (bundled in the same zip, right beside the
   // XML) and expresses the cut edit as multiple clips — one per kept segment,
   // gaps already removed — so nothing needs relinking AND the cut points stay
@@ -798,13 +969,16 @@
     var srcFrames = Math.round(S.buffer.duration * fps);
 
     var media = xmlEscape(mediaFileName());
+    // a real upload is bundled byte-for-byte, so describe ITS rate; the demo is
+    // re-encoded from the decoded buffer, whose rate is the right one there
+    var fileRate = (S.rawBytes && sniffSampleRate(S.rawBytes)) || S.buffer.sampleRate;
     var fileDef =
       '<file id="file-1">' +
       "<name>" + media + "</name>" +
       "<pathurl>" + media + "</pathurl>" +
       rate + "<duration>" + srcFrames + "</duration>" + tcode +
       "<media><audio>" +
-      "<samplecharacteristics><depth>16</depth><samplerate>" + S.buffer.sampleRate + "</samplerate></samplecharacteristics>" +
+      "<samplecharacteristics><depth>16</depth><samplerate>" + fileRate + "</samplerate></samplecharacteristics>" +
       "<channelcount>" + chans + "</channelcount>" +
       "</audio></media></file>";
 
@@ -906,8 +1080,32 @@
      finish must surface as a message, never as a hang.                        */
   var TRANSFORMERS_URL = "https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2";
   var TRANSFORMERS_UMD = "https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/transformers.min.js";
+  // large-v3-turbo needs WebGPU, which the older library (above) cannot drive —
+  // that requires transformers.js v3, loaded only when this model is picked so
+  // the proven small/base/tiny path never depends on it.
+  var TRANSFORMERS_URL_V3 = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/dist/transformers.web.min.js";
+  var LARGE_TURBO_MODEL = "onnx-community/whisper-large-v3-turbo";
+  function isV3Model(model) { return model === LARGE_TURBO_MODEL; }
   var MODEL_STALL_MS = 90000;   // no download progress at all for this long
   var SEG_TIMEOUT_MS = 180000;  // one segment taking longer than this
+
+  // Which library + pipeline options a model needs. v3's browser build is
+  // ESM-only (no importScripts global), so it only ever runs through the
+  // module-worker strategy. fp16 needs a GPU feature not every WebGPU adapter
+  // has; forceFp32 is used to retry once at a (larger) precision every adapter
+  // supports, rather than failing outright.
+  function engineFor(model, forceFp32) {
+    if (isV3Model(model)) {
+      return {
+        url: TRANSFORMERS_URL_V3,
+        pipelineOpts: {
+          device: "webgpu",
+          dtype: { encoder_model: forceFp32 ? "fp32" : "fp16", decoder_model_merged: "q4" }
+        }
+      };
+    }
+    return { url: TRANSFORMERS_URL, pipelineOpts: { quantized: true } };
+  }
 
   // Strategy 2: a classic worker + importScripts, for a browser that cannot run
   // a module worker. Still a worker, so it can never block the UI — the worst
@@ -922,14 +1120,13 @@
     '    if (!t || !t.pipeline) throw new Error("umd-global-missing");',
     '    if (m.type === "init") {',
     '      try { t.env.allowLocalModels = false; t.env.backends.onnx.wasm.numThreads = 1; } catch (ig) {}',
-    '      pipe = await t.pipeline("automatic-speech-recognition", m.model, {',
-    '        quantized: true,',
-    '        progress_callback: function (p) { self.postMessage({ type: "progress", p: p }); }',
-    '      });',
+    '      var popts = Object.assign({}, m.pipelineOpts || { quantized: true });',
+    '      popts.progress_callback = function (p) { self.postMessage({ type: "progress", p: p }); };',
+    '      pipe = await t.pipeline("automatic-speech-recognition", m.model, popts);',
     '      self.postMessage({ type: "ready" });',
     '    } else if (m.type === "run") {',
     '      var r = await pipe(m.audio, m.opts);',
-    '      self.postMessage({ type: "text", id: m.id, text: (r && r.text) || "" });',
+    '      self.postMessage({ type: "text", id: m.id, text: (r && r.text) || "", chunks: (r && r.chunks) || null });',
     '    }',
     '  } catch (err) {',
     '    self.postMessage({ type: "error", id: m.id, message: String((err && err.message) || err) });',
@@ -951,14 +1148,13 @@
     // multi-threaded WASM init can stall; pin to 1 thread for deterministic behaviour
     '        t.env.backends.onnx.wasm.numThreads = 1;',
     '      } catch (ignored) {}',
-    '      pipe = await t.pipeline("automatic-speech-recognition", m.model, {',
-    '        quantized: true,',
-    '        progress_callback: (p) => self.postMessage({ type: "progress", p: p })',
-    '      });',
+    '      const popts = Object.assign({}, m.pipelineOpts || { quantized: true });',
+    '      popts.progress_callback = (p) => self.postMessage({ type: "progress", p: p });',
+    '      pipe = await t.pipeline("automatic-speech-recognition", m.model, popts);',
     '      self.postMessage({ type: "ready" });',
     '    } else if (m.type === "run") {',
     '      const r = await pipe(m.audio, m.opts);',
-    '      self.postMessage({ type: "text", id: m.id, text: (r && r.text) || "" });',
+    '      self.postMessage({ type: "text", id: m.id, text: (r && r.text) || "", chunks: (r && r.chunks) || null });',
     '    }',
     '  } catch (err) {',
     '    self.postMessage({ type: "error", id: m.id, message: String((err && err.message) || err) });',
@@ -1018,6 +1214,17 @@
       // A cancel is a decision, and a stall means the CDN is unreachable — retrying
       // would just make the person wait out the same timeout twice.
       if (why === "cancelled" || why === "stalled") throw e;
+      if (isV3Model(model)) {
+        // v3's browser build is ESM-only, so a classic (importScripts) worker
+        // can never load it — retrying one would just fail again, confusingly.
+        // The one thing worth retrying is fp16, which not every WebGPU adapter
+        // supports; fall back once to fp32 (a bigger download) instead.
+        if (/fp16/i.test(why)) {
+          asr.initing = null;
+          return startWorker(model, true, true);
+        }
+        throw e;
+      }
       asr.initing = null;
       return startWorker(model, false);
     });
@@ -1025,7 +1232,7 @@
     return asr.initing;
   }
 
-  function startWorker(model, asModule) {
+  function startWorker(model, asModule, forceFp32) {
     return new Promise(function (resolve, reject) {
       var w, url;
       try {
@@ -1054,23 +1261,25 @@
       asr.onInitEnd = finish;
       w.onmessage = asrDispatch;
       w.onerror = function () { finish(new Error("worker-error")); };
-      w.postMessage({ type: "init", url: TRANSFORMERS_URL, model: model });
+      var eng = engineFor(model, forceFp32);
+      w.postMessage({ type: "init", url: eng.url, model: model, pipelineOpts: eng.pipelineOpts });
     });
   }
 
-  function runSegWorker(audio, opts) {
+  // resolves { text, chunks } — chunks carry per-word timings when asked for
+  function runSegWorker(audio, opts, timeoutMs) {
     return new Promise(function (resolve, reject) {
       var id = ++asr.seq, done = false;
       var t = setTimeout(function () {
         if (done) return;
         done = true; delete asr.pending[id];
         reject(new Error("segment-timeout"));
-      }, SEG_TIMEOUT_MS);
+      }, timeoutMs || SEG_TIMEOUT_MS);
       asr.pending[id] = function (m) {
         if (done) return;
         done = true; clearTimeout(t);
         if (m.type === "error") reject(new Error(m.message || "asr"));
-        else resolve(m.text);
+        else resolve({ text: m.text || "", chunks: m.chunks || null });
       };
       // audio is a fresh Float32Array per segment — hand off its buffer, no copy
       asr.worker.postMessage({ type: "run", id: id, audio: audio, opts: opts }, [audio.buffer]);
@@ -1089,7 +1298,12 @@
   }
 
   function extractSegmentMono16k(a, b) {
-    var buf = S.buffer, sr = buf.sampleRate, ch = buf.numberOfChannels;
+    return toMono16k(S.buffer, a, b);
+  }
+
+  // Whisper wants mono 16 kHz; downmix and resample whatever we hand it
+  function toMono16k(buf, a, b) {
+    var sr = buf.sampleRate, ch = buf.numberOfChannels;
     var i0 = Math.max(0, Math.round(a * sr)), i1 = Math.min(buf.length, Math.round(b * sr));
     var n = Math.max(0, i1 - i0), i, c;
     var mono = new Float32Array(n);
@@ -1109,7 +1323,47 @@
     return out;
   }
 
-  var MAX_ASR_SEGMENTS = 400;
+  // recognition now runs once over the whole timeline, so the cost scales with
+  // duration, not with how many clips the silence detector produced
+  var MAX_ASR_SECONDS = 1800;
+
+  // rough relative cost per second of audio, used only to size timeouts and to
+  // tell the person roughly how long to expect to wait. large-v3-turbo runs on
+  // the GPU rather than CPU WASM, so it isn't comparable to the others — its
+  // number here only sizes the timeout leash generously, not a real estimate.
+  function modelWeight(model) {
+    if (isV3Model(model)) return 3;
+    if (/small/.test(model)) return 5;
+    if (/base/.test(model)) return 2;
+    return 1;
+  }
+
+  // Detected once at page load (see the WebGPU check below); read here so the
+  // hint can say plainly whether large-v3-turbo will actually run.
+  var WEBGPU_OK = false;
+
+  // GitHub Pages cannot send the COOP/COEP headers that multi-threaded WASM
+  // needs, so recognition runs single-threaded no matter the machine. Say so up
+  // front rather than letting a slow run look broken.
+  function describeModelCost() {
+    var model = ($("model") && $("model").value) || "";
+    var hint = $("modelHint");
+    if (!hint) return;
+    if (isV3Model(model)) {
+      hint.textContent = "large-v3-turbo · 약 1.5GB (처음 한 번만 내려받아 브라우저에 저장, 기기에 따라 다름) · " +
+        "GPU에서 실행되어 속도는 예측하기 어렵습니다 · 정확도는 가장 높지만 이 페이지에서 실제로 오래 검증된 조합은 아닙니다. " +
+        (WEBGPU_OK ? "이 브라우저에서 WebGPU 사용 가능 — 선택할 수 있습니다." : "이 브라우저·기기는 WebGPU를 지원하지 않아 실행되지 않습니다.");
+      return;
+    }
+    var w = modelWeight(model);
+    var name = /small/.test(model) ? "small" : /base/.test(model) ? "base" : "tiny";
+    var size = /small/.test(model) ? "약 250MB" : /base/.test(model) ? "약 80MB" : "약 40MB";
+    var per = (w * 1.5).toFixed(0);
+    hint.textContent = name + " · " + size + " (처음 한 번만 내려받아 브라우저에 저장) · " +
+      "오디오 10초당 대략 " + per + "~" + (w * 4) + "초 소요. " +
+      (w >= 5 ? "정확도가 가장 높지만 가장 오래 걸립니다. " : "") +
+      "진행 중에도 화면은 멈추지 않고 중단할 수 있습니다.";
+  }
 
   function asrProgressReporter(onStatus) {
     return function (p) {
@@ -1128,10 +1382,22 @@
     // so this can only ever fail — say why instead of trying and stalling
     if (location.protocol === "file:") throw new Error("file-protocol");
     var segs = timelineSegments();
-    if (segs.length > MAX_ASR_SEGMENTS) {
-      throw new Error("too-many-segments:" + segs.length);
+    if (resultDur() > MAX_ASR_SECONDS) {
+      throw new Error("too-long:" + Math.round(resultDur()));
     }
-    var model = ($("model") && $("model").value) || "Xenova/whisper-tiny";
+    var model = ($("model") && $("model").value) || "Xenova/whisper-small";
+    // large-v3-turbo cannot run at all without WebGPU — fail before ever
+    // starting a worker or downloading anything, with a clear reason. The API
+    // existing is not enough to check: a browser can expose navigator.gpu yet
+    // still have no usable adapter (blocklisted GPU, disabled flag), so this
+    // actually asks for one rather than just feature-detecting the property.
+    if (isV3Model(model)) {
+      var adapter = null;
+      if (navigator.gpu && navigator.gpu.requestAdapter) {
+        try { adapter = await navigator.gpu.requestAdapter(); } catch (ignored) { adapter = null; }
+      }
+      if (!adapter) throw new Error("no-webgpu");
+    }
     var report = asrProgressReporter(onStatus);
 
     asr.cancelled = false;
@@ -1152,20 +1418,242 @@
     }
 
     var lang = $("lang").value || undefined;
-    var texts = [];
-    for (var i = 0; i < segs.length; i++) {
-      if (asr.cancelled) throw new Error("cancelled");
-      onStatus("음성 인식 중 " + (i + 1) + "/" + segs.length + "… (중단 가능)");
-      var audio = extractSegmentMono16k(segs[i].srcA, segs[i].srcB);
-      var opts = { task: "transcribe" };
-      if (lang) opts.language = lang;
-      var text = "";
-      if (audio.length) text = await runSegWorker(audio, opts);
-      texts.push(String(text).trim());
-      // let the browser repaint between segments
-      await new Promise(function (r) { setTimeout(r, 0); });
+
+    // ---- ONE pass over the trimmed timeline, not one call per clip ----------
+    // The trimmed buffer IS the timeline, so word timings come back already in
+    // timeline seconds — nothing to map. Transcribing the whole thing at once
+    // also lets Whisper see complete sentences, which is what makes its
+    // punctuation usable; per-clip calls fed it half-sentences.
+    var trimmed = buildTrimmed();
+    var audio = toMono16k(trimmed, 0, trimmed.duration);
+    var dur = trimmed.duration;
+    // Long jobs need a longer leash, but still a finite one. A bigger model is
+    // several times slower per second of audio, so the leash has to scale with
+    // it — otherwise picking `small` just produces a timeout.
+    var budget = Math.min(1800000,
+      Math.max(180000, Math.round(dur * 15000 * modelWeight(model))));
+
+    var tick = startElapsed(onStatus, dur);
+    var words = null, plain = "";
+    try {
+      // chunk_length_s is required: without it Whisper silently truncates
+      // anything past its 30-second window.
+      var base = { task: "transcribe", chunk_length_s: 30, stride_length_s: 5 };
+      if (lang) base.language = lang;
+
+      var res = null;
+      try {
+        res = await runSegWorker(audio, mix(base, { return_timestamps: "word" }), budget);
+        words = normaliseWords(res.chunks);
+      } catch (wordErr) {
+        if ((wordErr && wordErr.message) === "cancelled") throw wordErr;
+        words = null;
+      }
+      if (!words || !words.length) {
+        // some builds refuse word-level alignment — coarser timings still beat
+        // clip-boundary timings, so try phrase level, then plain text
+        if (asr.cancelled) throw new Error("cancelled");
+        if (!res) res = await runSegWorker(audio, mix(base, { return_timestamps: true }), budget);
+        words = normaliseWords(res.chunks);
+        plain = res.text || "";
+      } else {
+        plain = res.text || "";
+      }
+    } finally {
+      tick.stop();
     }
-    return { segs: segs, texts: texts };
+    if (asr.cancelled) throw new Error("cancelled");
+
+    var cues = words && words.length
+      ? buildCues(words, dur)
+      : spreadPlainText(plain, segs);          // last resort: no timings at all
+    if (!cues.length) throw new Error("no-speech");
+    return { cues: cues, dur: dur };
+  }
+
+  function mix(a, b) {
+    var o = {}, k;
+    for (k in a) if (Object.prototype.hasOwnProperty.call(a, k)) o[k] = a[k];
+    for (k in b) if (Object.prototype.hasOwnProperty.call(b, k)) o[k] = b[k];
+    return o;
+  }
+
+  // inference gives no progress events, so show elapsed time — otherwise a long
+  // job is indistinguishable from a hung one
+  function startElapsed(onStatus, dur) {
+    var t0 = Date.now();
+    function paintStatus() {
+      var s = Math.round((Date.now() - t0) / 1000);
+      onStatus("음성 인식 중… " + s + "초 경과 (오디오 " + dur.toFixed(0) + "초 · 중단 가능)");
+    }
+    paintStatus();
+    var iv = setInterval(paintStatus, 1000);
+    return { stop: function () { clearInterval(iv); } };
+  }
+
+  // Whisper hands back [{ text, timestamp: [start, end] }, …]; drop anything
+  // without usable timings rather than trusting a null
+  function normaliseWords(chunks) {
+    if (!chunks || !chunks.length) return null;
+    var out = [];
+    for (var i = 0; i < chunks.length; i++) {
+      var c = chunks[i], t = c && c.timestamp;
+      var txt = String((c && c.text) || "").trim();
+      if (!txt || !t || t[0] == null) continue;
+      var a = Number(t[0]), b = t[1] == null ? a : Number(t[1]);
+      if (!isFinite(a) || !isFinite(b)) continue;
+      out.push({ text: txt, a: a, b: Math.max(b, a) });
+    }
+    return out.length ? out : null;
+  }
+
+  /* ---------- caption shaping rules (tuned for Korean, 9:16) ---------- */
+  var CC = {
+    charsPerLine: 14,   // a comfortable line on a vertical phone frame
+    maxLines: 2,
+    maxCps: 9,          // chars per second before a cue is too dense to read
+    minDur: 1.0,
+    maxDur: 6.0,
+    fillGap: 2.0,       // hold a caption across a gap up to this long (no blanks)
+    pause: 0.5          // a silence this long ends a caption even mid-sentence
+  };
+  function maxCharsPerCue() { return CC.charsPerLine * CC.maxLines; }
+
+  function isSentenceEnd(w) { return /[.!?…。！？]["')\]]?$/.test(w); }
+  function isClauseEnd(w) { return /[,·;:、，]["')\]]?$/.test(w); }
+
+  // group words -> sentences -> cues that satisfy the reading rules
+  function buildCues(words, totalDur) {
+    var groups = [], cur = [];
+    for (var i = 0; i < words.length; i++) {
+      cur.push(words[i]);
+      var nextGap = i + 1 < words.length ? words[i + 1].a - words[i].b : 0;
+      if (isSentenceEnd(words[i].text) || nextGap >= CC.pause || i === words.length - 1) {
+        if (cur.length) groups.push(cur);
+        cur = [];
+      }
+    }
+
+    var cues = [];
+    for (i = 0; i < groups.length; i++) splitGroup(groups[i], cues, i);
+
+    // Merge anything too brief to read back into its neighbour — but ONLY within
+    // the same sentence. Merging across a sentence boundary produces a caption
+    // holding the tail of one sentence and the head of the next, which reads
+    // worse than the short cue it was meant to fix.
+    for (i = 0; i < cues.length - 1; i++) {
+      var a = cues[i], b = cues[i + 1];
+      if (a.g !== b.g) continue;
+      var joined = a.text.length + 1 + b.text.length;
+      var tooShort = (a.b - a.a) < CC.minDur || (b.b - b.a) < CC.minDur;
+      // A caption that flashes under a second is worse than one that runs a
+      // little past the normal two-line cap, so allow modest overflow here —
+      // but only when the merge is actually rescuing a too-short cue.
+      var cap = tooShort ? maxCharsPerCue() + 8 : maxCharsPerCue();
+      if (tooShort && joined <= cap && (b.b - a.a) <= CC.maxDur) {
+        a.text += " " + b.text; a.b = b.b;
+        cues.splice(i + 1, 1); i--;
+      }
+    }
+
+    // No blank space between captions. A cue naturally spans only the words it
+    // contains, so every breath and every bit of leftover padding between clips
+    // showed up as a frame with no caption on it. Each cue now runs until the
+    // next one begins, the first starts at 0 and the last runs to the end, so the
+    // caption track is continuous. A gap longer than fillGap is a real pause —
+    // hold the caption for fillGap and let the rest go blank.
+    for (i = 0; i < cues.length; i++) {
+      var c = cues[i];
+      if (i === 0) c.a = 0;
+      var until = i + 1 < cues.length ? cues[i + 1].a : totalDur;
+      c.b = (until - c.b) <= CC.fillGap ? until : c.b + CC.fillGap;
+      c.b = Math.min(c.b, totalDur);
+      c.a = Math.max(0, c.a);
+      if (c.b <= c.a) c.b = Math.min(totalDur, c.a + 0.2);
+    }
+
+    for (i = 0; i < cues.length; i++) cues[i].lines = wrapKo(cues[i].text);
+    return cues.filter(function (c) { return c.b > c.a && c.text; });
+  }
+
+  // recursively cut a word run down until every piece is readable
+  function splitGroup(ws, out, g) {
+    var text = ws.map(function (w) { return w.text; }).join(" ").replace(/\s+/g, " ").trim();
+    var a = ws[0].a, b = ws[ws.length - 1].b, dur = Math.max(0.01, b - a);
+    var tooLong = text.length > maxCharsPerCue();
+    var tooSlow = dur > CC.maxDur;
+    // Reading rate only justifies a split once there is a real amount of text.
+    // Splitting a short natural sentence does not slow the speaker down — it
+    // just fragments a line that was already readable.
+    var tooDense = text.length > maxCharsPerCue() * 0.75 && (text.length / dur) > CC.maxCps;
+
+    if (ws.length > 1 && (tooLong || tooSlow || tooDense)) {
+      var at = pickBreak(ws);
+      if (at > 0 && at < ws.length) {
+        splitGroup(ws.slice(0, at), out, g);
+        splitGroup(ws.slice(at), out, g);
+        return;
+      }
+    }
+    out.push({ a: a, b: b, text: text, g: g });
+  }
+
+  // prefer a clause boundary, then the widest pause, then the midpoint
+  function pickBreak(ws) {
+    var mid = ws.length / 2, best = -1, bestScore = -Infinity;
+    for (var i = 0; i < ws.length - 1; i++) {
+      var score = -Math.abs((i + 1) - mid) * 0.6;
+      if (isClauseEnd(ws[i].text)) score += 6;
+      score += Math.min(3, (ws[i + 1].a - ws[i].b) * 6);
+      if (score > bestScore) { bestScore = score; best = i + 1; }
+    }
+    return best < 1 ? Math.max(1, Math.round(mid)) : best;
+  }
+
+  // break into at most two lines on 어절 (word) boundaries, kept balanced —
+  // Korean gets much harder to read when a word is split across lines
+  function wrapKo(text) {
+    if (text.length <= CC.charsPerLine) return [text];
+    var w = text.split(" ");
+    if (w.length === 1) return [text];
+    var bestAt = 1, bestDiff = Infinity;
+    for (var i = 1; i < w.length; i++) {
+      var l1 = w.slice(0, i).join(" ").length, l2 = w.slice(i).join(" ").length;
+      var diff = Math.abs(l1 - l2) + (Math.max(l1, l2) > CC.charsPerLine ? 100 : 0);
+      if (diff < bestDiff) { bestDiff = diff; bestAt = i; }
+    }
+    return [w.slice(0, bestAt).join(" "), w.slice(bestAt).join(" ")];
+  }
+
+  // no timings came back at all: fall back to clip boundaries, splitting the
+  // text across clips in proportion to their length
+  function spreadPlainText(text, segs) {
+    var t = String(text || "").trim();
+    if (!t || !segs.length) return [];
+    // split after sentence punctuation WITHOUT a lookbehind — an unsupported
+    // lookbehind fails when the script is parsed, taking the whole page with it
+    var sentences = (t.match(/[^.!?…]+[.!?…]*/g) || [t])
+      .map(function (s) { return s.trim(); }).filter(Boolean);
+    if (sentences.length <= 1) sentences = [t];
+    var cues = [], per = Math.ceil(sentences.length / segs.length), k = 0;
+    for (var i = 0; i < segs.length && k < sentences.length; i++) {
+      var piece = sentences.slice(k, k + per).join(" ").trim();
+      k += per;
+      if (piece) cues.push({ a: segs[i].tlA, b: segs[i].tlB, text: piece, lines: wrapKo(piece) });
+    }
+    return cues;
+  }
+
+  // QC numbers worth telling the person about
+  function cueStats(cues) {
+    var dense = 0, longest = 0, chars = 0;
+    for (var i = 0; i < cues.length; i++) {
+      var c = cues[i], d = Math.max(0.01, c.b - c.a);
+      if (c.text.length / d > CC.maxCps) dense++;
+      longest = Math.max(longest, c.text.length);
+      chars += c.text.length;
+    }
+    return { n: cues.length, dense: dense, longest: longest, chars: chars };
   }
 
   function srtStamp(t) {
@@ -1178,11 +1666,12 @@
     return p2(h) + ":" + p2(m) + ":" + p2(s) + "," + p3(ms);
   }
 
-  function buildSrt(segs, texts) {
+  function buildSrt(cues) {
     var out = "";
-    for (var i = 0; i < segs.length; i++) {
-      var text = texts[i] || "(인식 결과 없음)";
-      out += (i + 1) + "\n" + srtStamp(segs[i].tlA) + " --> " + srtStamp(segs[i].tlB) + "\n" + text + "\n\n";
+    for (var i = 0; i < cues.length; i++) {
+      var c = cues[i];
+      var body = (c.lines && c.lines.length ? c.lines : [c.text]).join("\n");
+      out += (i + 1) + "\n" + srtStamp(c.a) + " --> " + srtStamp(c.b) + "\n" + body + "\n\n";
     }
     return out;
   }
@@ -1210,15 +1699,17 @@
     if (m === "model-stalled") return "인식 모델을 내려받지 못했습니다 (네트워크·사내 방화벽이 cdn.jsdelivr.net 을 막고 있을 수 있습니다)";
     if (m === "segment-timeout") return "이 컴퓨터에서 음성 인식이 너무 오래 걸립니다 (모델을 tiny로 낮춰 보세요)";
     if (m.indexOf("worker-unavailable") === 0) return "이 브라우저에서 백그라운드 음성 인식을 실행할 수 없습니다 — 화면을 멈추게 하지 않으려고 자막만 건너뛰었습니다 (크롬·엣지 최신 버전 권장)";
-    if (m.indexOf("too-many-segments:") === 0) return "컷 구간이 " + m.split(":")[1] + "개로 너무 많습니다 (자막은 구간당 한 번씩 인식하므로 " + MAX_ASR_SEGMENTS + "개까지만 지원합니다)";
+    if (m.indexOf("too-long:") === 0) return "결과 길이가 " + Math.round(m.split(":")[1] / 60) + "분으로 너무 깁니다 (자막은 " + (MAX_ASR_SECONDS / 60) + "분까지만 지원합니다)";
+    if (m === "no-speech") return "인식된 음성이 없습니다 (무음이거나 목소리가 너무 작을 수 있습니다)";
     if (m === "file-protocol") return "HTML 파일을 직접 열면(file://) 인식 모델을 불러올 수 없습니다 — 웹서버로 올려서 열어 주세요";
+    if (m === "no-webgpu") return "이 브라우저·기기는 WebGPU를 지원하지 않아 large-v3-turbo 모델을 쓸 수 없습니다 (small 이하 모델을 선택해 주세요)";
     return "브라우저가 음성 인식을 실행하지 못했습니다 (" + (m || "원인 불명") + ")";
   }
 
   async function doExport() {
     var btn = $("export");
     var wantCC = $("cc").checked;
-    var ccFailed = null;
+    var ccFailed = null, ccStats = null;
     btn.disabled = true;
     statusPinned = true;
     setStatus("파일을 만드는 중…");
@@ -1249,8 +1740,10 @@
         $("cancel").hidden = false;
         try {
           var tr = await transcribeAll(function (msg, kind) { setStatus(msg, kind); });
-          srtText = buildSrt(tr.segs, tr.texts);
-          ccNote = base + "_자막.srt          컷된 타임라인에 맞춘 자막 (음성 인식 결과이므로 오탈자 확인 필요)";
+          srtText = buildSrt(tr.cues);
+          ccStats = cueStats(tr.cues);
+          ccNote = base + "_자막.srt          컷된 타임라인에 맞춘 자막 " +
+            "(" + ccStats.n + "개 · 음성 인식 결과이므로 오탈자 확인 필요)";
           setStatus("파일을 만드는 중…");
         } catch (ccErr) {
           // captions are optional — never let them take the audio/XML down with them
@@ -1306,8 +1799,14 @@
         "혹시 미디어 찾기 창이 뜬다면 같은 폴더의 " + mediaName + " 를 지정해 주세요.\n" +
         "XML은 원본을 재인코딩하지 않고 참조만 하므로 음질 손실이 없고, 각 컷 지점이\n" +
         "개별 클립으로 남아 있어 프리미어에서 다시 다듬을 수 있습니다.\n" +
-        "시퀀스 프레임레이트를 프로젝트와 다르게 두면 편집 시 프레임 단위로\n" +
-        "반올림되어 미세하게 어긋날 수 있습니다.\n" +
+        "\n컷 지점 정렬\n" +
+        "------------------------------------------\n" +
+        "모든 컷 지점은 " + P.fps + "fps 프레임 경계에 정확히 정렬돼 있습니다. 그래서 이 WAV와\n" +
+        "XML 시퀀스는 완전히 동일한 편집을 나타내고, 프리미어가 임포트할 때 컷을\n" +
+        "다시 반올림하지 않습니다 (말 앞이 잘리거나 공백이 생기지 않음).\n" +
+        "대신 무음이 컷당 한 프레임 미만(" + (1000 / P.fps).toFixed(0) + "ms 이하)만큼 덜 지워집니다.\n" +
+        "중요: 프리미어 시퀀스를 반드시 " + P.fps + "fps로 두세요. 프로젝트 프레임레이트가\n" +
+        "다르면 프리미어가 컷을 자기 그리드로 다시 옮기면서 어긋납니다.\n" +
         (srtText ?
           "\nSRT 자막 사용하기\n" +
           "------------------------------------------\n" +
@@ -1315,7 +1814,20 @@
           "2. 프로젝트 패널에 생긴 캡션 클립을 시퀀스 위 트랙으로 끌어다 놓습니다.\n" +
           "   자막 시간이 컷된 타임라인 기준으로 이미 맞춰져 있어 그대로 얹으면 됩니다.\n" +
           "3. 자막은 오픈소스 음성 인식(Whisper) 결과라 사람이 한 번 검수하는 걸 권장합니다.\n" +
-          "   인식 모델: " + (($("model") && $("model").value) || "-") + "\n"
+          "   인식 모델: " + (($("model") && $("model").value) || "-") + "\n" +
+          "\n자막 구성 방식\n" +
+          "------------------------------------------\n" +
+          "자막 " + ccStats.n + "개 · 가장 긴 자막 " + ccStats.longest + "자\n" +
+          "문장 끝(. ? !)과 " + CC.pause.toFixed(1) + "초 이상의 무음을 기준으로 끊고,\n" +
+          "한 줄 최대 " + CC.charsPerLine + "자 · 최대 " + CC.maxLines + "줄 · " +
+          CC.minDur.toFixed(1) + "~" + CC.maxDur.toFixed(1) + "초로 맞췄습니다.\n" +
+          "줄바꿈은 어절 경계에서만 하므로 단어가 잘리지 않습니다.\n" +
+          "자막은 처음부터 끝까지 끊김 없이 이어집니다 (자막 사이 빈 화면 없음).\n" +
+          "단, " + CC.fillGap.toFixed(1) + "초를 넘는 긴 공백은 실제 쉼으로 보고 비워 둡니다.\n" +
+          (ccStats.dense
+            ? "참고: " + ccStats.dense + "개 자막은 초당 " + CC.maxCps +
+              "자를 넘어 다소 빠릅니다 (말이 빠른 구간). 필요하면 프리미어에서 나눠 주세요.\n"
+            : "모든 자막이 읽기 속도 기준(초당 " + CC.maxCps + "자) 안에 들어옵니다.\n")
           : "")
       );
       files.push({ name: "읽어보세요.txt", data: readme });
@@ -1359,6 +1871,7 @@
   function loadBuffer(buf, name, demo, rawBytes) {
     stop();
     S.buffer = buf; S.name = name; S.isDemo = !!demo; S.rawBytes = rawBytes || null;
+    S.head.src = 0; S.head.res = 0;
     $("fname").textContent = name;
     $("fchip").hidden = !demo;
     $("fchip").textContent = "예시";
@@ -1417,6 +1930,27 @@
     warn.textContent = "이 페이지를 파일로 직접 열었습니다(file://). 브라우저 보안 정책상 자막 기능만 " +
       "동작하지 않습니다 — 웹서버에 올려서 열면 정상 동작합니다. 컷·WAV·XML은 지금도 문제 없습니다.";
   }
+
+  $("model").addEventListener("change", describeModelCost);
+  describeModelCost();
+
+  // Detect WebGPU once at load — large-v3-turbo below reads WEBGPU_OK to
+  // explain up front whether it can actually run here, instead of letting the
+  // person pick it and find out only after a failed download.
+  (function () {
+    if (!navigator.gpu || !navigator.gpu.requestAdapter) { describeModelCost(); return; }
+    navigator.gpu.requestAdapter().then(function (a) {
+      var el = $("gpuNote");
+      if (a) {
+        WEBGPU_OK = true;
+        if (el) {
+          el.hidden = false;
+          el.textContent = "이 브라우저는 WebGPU를 지원합니다 — 인식 모델에서 large-v3-turbo를 선택할 수 있습니다.";
+        }
+      }
+      describeModelCost();
+    })["catch"](function () { describeModelCost(); });
+  })();
 
   $("cancel").addEventListener("click", function () {
     asr.cancelled = true;
@@ -1479,7 +2013,13 @@
     $("specTc").textContent = P.fps + "fps 시간 코드";
     paint();
   }
-  $("fps").addEventListener("change", function () { P.fps = parseFloat(this.value); syncSeq(); });
+  // changing the frame rate moves the grid the cuts are snapped to, so the whole
+  // edit has to be recomputed — not just relabelled
+  $("fps").addEventListener("change", function () {
+    P.fps = parseFloat(this.value);
+    recompute();
+    syncSeq();
+  });
   $("preset").addEventListener("change", function () {
     var custom = this.value === "custom";
     $("sizeFields").hidden = !custom;
@@ -1501,10 +2041,12 @@
 
   $("playSrc").addEventListener("click", function () { S.playing === "src" ? stop() : play("src"); });
   $("playRes").addEventListener("click", function () { S.playing === "res" ? stop() : play("res"); });
-  $("stop").addEventListener("click", stop);
+  $("stop").addEventListener("click", function () { stop(); });
+  bindScrub("wave", "src");
+  bindScrub("result", "res");
   $("export").addEventListener("click", doExport);
 
-  window.addEventListener("resize", function () { drawWave(null); drawResult(null); });
+  window.addEventListener("resize", function () { drawWave(headOf("src")); drawResult(headOf("res")); });
 
   // decorative level meter
   (function () {
